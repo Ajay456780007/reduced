@@ -1,0 +1,263 @@
+import os
+import gzip
+from urllib.parse import unquote
+from Bio import SeqIO
+from Bio.Seq import Seq
+import pandas as pd
+
+# === Paths ===
+dna_dir = "dataset/dataset1/dna_chromosomes/"
+gff3_dir = "dataset/dataset1/gff3_files/"
+
+# === Collect all FASTA and GFF3 files ===
+fasta_files = sorted([
+    os.path.join(dna_dir, f) for f in os.listdir(dna_dir)
+    if f.lower().endswith(".fa.gz")
+])
+gff3_files = sorted([
+    os.path.join(gff3_dir, f) for f in os.listdir(gff3_dir)
+    if f.lower().endswith(".gff3")
+])
+
+# === Parse GFF3 attributes ===
+def parse_attributes(attr_str):
+    attr_dict = {}
+    for pair in attr_str.strip().split(";"):
+        if "=" in pair:
+            key, value = pair.split("=", 1)
+            attr_dict[key.strip()] = unquote(value.strip())
+    return attr_dict
+
+# === Function to parse GFF3 and extract CDS entries for a given chromosome ===
+def parse_gff3_cds(gff3_file, chrom_id):
+    cds_dict = {}
+    with open(gff3_file, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) < 9:
+                continue
+            if parts[2] != "CDS":
+                continue
+            if parts[0] != chrom_id:
+                continue
+
+            start = int(parts[3]) - 1  # GFF3 is 1-based; convert to 0-based
+            end = int(parts[4])        # end is exclusive
+            strand = parts[6]
+            attrs = parse_attributes(parts[8])
+            parent_id = attrs.get("Parent", "NA")
+
+            if parent_id not in cds_dict:
+                cds_dict[parent_id] = {
+                    "strand": strand,
+                    "ranges": []
+                }
+            cds_dict[parent_id]["ranges"].append((start, end))
+    return cds_dict
+
+# === Extract CDS sequences with start/end positions ===
+cds_sequences = []
+
+for fasta_path, gff_path in zip(fasta_files, gff3_files):
+    print(f"Processing: {os.path.basename(fasta_path)} with {os.path.basename(gff_path)}")
+
+    # Read chromosome sequence
+    if fasta_path.endswith(".gz"):
+        with gzip.open(fasta_path, "rt", encoding="utf-8") as f:
+            record = next(SeqIO.parse(f, "fasta"))
+    else:
+        with open(fasta_path, "r", encoding="utf-8") as f:
+            record = next(SeqIO.parse(f, "fasta"))
+
+    chrom_seq = record.seq
+    chrom_id = record.id
+
+    # Parse CDS entries
+    cds_dict = parse_gff3_cds(gff_path, chrom_id)
+    print(f"Found {len(cds_dict)} CDS transcripts in {os.path.basename(gff_path)}")
+
+    for parent_id, info in cds_dict.items():
+        strand = info["strand"]
+        regions = sorted(info["ranges"], key=lambda x: x[0])  # sort by start
+        full_seq = "".join(str(chrom_seq[start:end]) for start, end in regions)
+        if strand == "-":
+            full_seq = str(Seq(full_seq).reverse_complement())
+
+        # Get the genomic span
+        transcript_start = min(start for start, end in regions)
+        transcript_end = max(end for start, end in regions)
+
+        cds_sequences.append({
+            "transcript_id": parent_id,
+            "chrom": chrom_id,
+            "strand": strand,
+            "start": transcript_start,
+            "end": transcript_end,
+            "sequence": full_seq
+        })
+
+# === Convert to DataFrame and show
+df_cds = pd.DataFrame(cds_sequences)
+print(df_cds.head())
+
+# Save if needed
+# df_cds.to_csv("parsed_cds_with_positions.csv", index=False)
+max_len=max(df_cds['sequence'].str.len())
+
+print(max_len)
+
+df_cds.to_csv("dataset/dataset1/cds_sequences.csv", index=False)
+
+import pandas as pd
+
+# === 1. Load your data
+df_cds = pd.read_csv("dataset/dataset1/cds_sequences.csv")
+alias_df = pd.read_csv("dataset/dataset1/alias/genes_to_alias_ids.tsv", sep="\t", header=None)
+tpm_df = pd.read_csv("dataset/dataset1/geo_file/abundance.tsv", sep="\t")
+
+# === 2. Clean column names
+alias_df.columns = ["e_id", "source", "d_id", "agpv4_id"]
+tpm_df["gene_id"] = tpm_df["target_id"].apply(lambda x: x.split("_T")[0])
+
+# === 3. Clean `transcript_id` in `df_cds`
+df_cds["clean_gene_id"] = df_cds["transcript_id"].apply(
+    lambda x: x.replace("transcript:", "").split("_T")[0]
+)
+
+# === 4. Map Zm00001eb... to Zm00001d... via alias file
+df_merged = df_cds.merge(
+    alias_df[["e_id", "d_id"]],
+    left_on="clean_gene_id",
+    right_on="e_id",
+    how="left"
+)
+
+# === 5. Average TPM per gene (Zm00001d...)
+avg_tpm = (
+    tpm_df.groupby("gene_id", as_index=False)["tpm"]
+    .mean()
+    .rename(columns={"tpm": "avg_tpm"})
+)
+
+# === 6. Merge with averaged TPM values
+final_df = df_merged.merge(
+    avg_tpm,
+    left_on="d_id",
+    right_on="gene_id",
+    how="left"
+)
+
+# === 7. Drop intermediate columns
+final_df = final_df.drop(columns=["clean_gene_id", "e_id", "gene_id"])
+
+# === 8. Output final result
+print(final_df.head())
+# Optional: Save to CSV
+# final_df.to_csv("final_matched_cds_avg_tpm.csv", index=False)
+
+
+final_df.dropna(subset=['avg_tpm'], inplace=True)
+
+max_len=final_df['sequence'].str.len().max()
+print("Max length of sequences:", max_len)
+
+final_df.to_csv("dataset/dataset1/final_matched_cds_tpm.csv", index=False)
+
+import pandas as pd
+import numpy as np
+
+# === 1. Load your dataset
+df = pd.read_csv("dataset/dataset1/final_matched_cds_tpm.csv")  # Replace with your actual file path
+
+# === 2. Encode `transcript_id` numerically
+df["transcript_index"] = pd.factorize(df["transcript_id"])[0]
+
+# === 3. Encode `strand`: '+' -> 1, '-' -> 0
+df["strand_numeric"] = df["strand"].map({'+': 1, '-': 0})
+
+# === 4. Encode `sequence`: A=0, T=1, G=2, C=3, others=4
+def encode_sequence(seq):
+    mapping = {'A': 0, 'T': 1, 'G': 2, 'C': 3}
+    return [mapping.get(base.upper(), 4) for base in seq]
+
+df["sequence_encoded"] = df["sequence"].apply(encode_sequence)
+
+# === 5. Compute expression label from avg_tpm
+def compute_labels(tpm_array):
+    mean_tpm = np.mean(tpm_array)
+    low = mean_tpm / 2
+    high = mean_tpm * 1.5
+    labels = []
+    for t in tpm_array:
+        if t < 1:
+            labels.append(0)
+        elif t > 6:
+            labels.append(2)
+        else:
+            labels.append(1)
+    return np.array(labels, dtype=np.int32)
+
+df["expression_label"] = compute_labels(df["avg_tpm"].values)
+
+# === 6. Drop unnecessary columns
+df = df.drop(columns=["transcript_id", "strand", "sequence", "d_id"])
+
+# === 7. Output final DataFrame
+print(df.head())
+
+# Optional: save it
+# df.to_csv("processed_gene_expression.csv", index=False)
+
+
+from collections import Counter
+
+
+Counter(df['expression_label']).items()
+
+df.drop_duplicates(subset=['sequence_encoded'], inplace=True)
+
+FIXED_LEN = 6000
+PAD_VALUE = 4
+
+def pad_or_truncate(seq):
+    if len(seq) > FIXED_LEN:
+        return seq[:FIXED_LEN]
+    return seq + [PAD_VALUE] * (FIXED_LEN - len(seq))
+
+df['sequence_encoded'] = df['sequence_encoded'].apply(pad_or_truncate)
+
+df.drop(columns=['avg_tpm'], inplace=True)
+
+print(df["expression_label"].value_counts())
+
+import numpy as np
+
+# Convert sequence and label to arrays (now all sequences have equal length)
+sequences = np.array(df['sequence_encoded'].tolist(), dtype=np.int32)  # shape: (n_samples, 7000)
+labels = df['expression_label'].values.astype(np.int32)                # shape: (n_samples,)
+
+# Save sequences and labels
+np.save('dataset/dataset1/sequence_encoded.npy', sequences)
+np.save('dataset/dataset1/expression_label.npy', labels)
+
+# Optionally save both stacked together (if needed for specific use)
+seq_and_label = np.column_stack([sequences, labels])  # shape: (n_samples, 7001)
+np.save('dataset/dataset1/seq_and_label.npy', seq_and_label)
+
+# Save other numerical features
+other_features = df.drop(columns=['sequence_encoded', 'expression_label'])
+np.save('dataset/dataset1/other_features.npy', other_features.values)
+
+
+other_features = final_df.drop(columns=['sequence_encoded', 'expression_label', 'transcript_index','transcript_id',"sequence","avg_tpm","start","end","strand","d_id"])
+    np.save('dataset/dataset1/other_features.npy', other_features.values)
+
+    # === Logging info ===
+    print("Unique label values:", final_df["expression_label"].unique())
+    print("Transcript ID sample:", final_df["transcript_id"].head())
+    print("other_features shape:", other_features.shape)
+    print("sequence_encoded shape:", np.load('dataset/dataset1/sequence_encoded.npy').shape)
+    print("expression_label shape:", np.load('dataset/dataset1/expression_label.npy').shape)
+
